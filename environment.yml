@@ -21,5 +21,5 @@ dependencies:
       - mujoco==3.8.0
       - dm_control==1.0.40
       - amago @ git+https://github.com/UT-Austin-RPL/amago.git@metabfm-release
-      - dmc_remastered @ git+https://github.com/jakegrigsby/dmc_remastered.git@12fda9976caf070c0c2f1f91cbe7852dbb4d7785
+      - dmc_remastered @ git+https://github.com/jakegrigsby/dmc_remastered.git@86a3999ef382a4719439bf5cebe7a0c2f23bb65d
       - -e .

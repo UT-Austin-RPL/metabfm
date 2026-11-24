@@ -8,7 +8,7 @@ This repository contains code for the paper [Meta-Reinforcement Learning with Ze
 git clone https://github.com/UT-Austin-RPL/metabfm.git && cd metabfm
 conda env create -f environment.yml
 conda activate metabfm
-pip install flash-attn --no-build-isolation
+FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE pip install flash-attn --no-build-isolation   # prebuilt wheel
 ```
 
 ## Running experiments
