@@ -1,0 +1,9 @@
+# DynamicsLearner: NO-OP variant.
+#
+# Publishes scalar-zero stub keys (rldp, idm, dyn_tstep_emb) into batch.obs and
+# does not train any dynamics network. Use with intrinsic/noop and the "base
+# tdjepa" baseline.
+
+import metabfm.rl.dynamics_learner
+
+BilevelExperiment.dynamics_learner_type = @NoOpDynamicsLearner

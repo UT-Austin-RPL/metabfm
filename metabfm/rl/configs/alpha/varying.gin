@@ -1,0 +1,28 @@
+# α axis: VARYING.
+#
+# α ~ ZeroInflatedUniform([0, 1]) with 20% mass at α=0 (pure SF / V_td) and
+# 20% mass at α=1 (pure intrinsic Q_I); remaining 60% is uniform on (0, 1).
+# n_alphas = 3 keeps the cross-product slot count manageable when paired
+# with beta/varying.gin (3 × 3 = 9 slots) while still allowing endpoint
+# pinning at α=0 and α=1 inside compute_losses.
+#
+# val_alpha_schedule = EpisodeThresholdSchedule: explore at α=high during
+# the first ``threshold`` episodes of each trial, then exploit at α=low.
+# ``threshold`` is bound per env overlay (depends on k).
+#
+# Scopes (alpha/, alpha_val/) keep ZeroInflatedUniform / EpisodeThreshold
+# bindings independent from beta/*.gin counterparts.
+
+import metabfm.rl.zero_shot_rl
+
+TDJepa.alpha_dist = @alpha/ZeroInflatedUniform()
+alpha/ZeroInflatedUniform.max_value = 1.0
+alpha/ZeroInflatedUniform.p_zero = 0.2
+alpha/ZeroInflatedUniform.p_one = 0.2
+
+TDJepa.n_alphas = 3
+
+TDJepa.val_alpha_schedule = @alpha_val/EpisodeThresholdSchedule()
+alpha_val/EpisodeThresholdSchedule.high = 1.0
+alpha_val/EpisodeThresholdSchedule.low = 0.0
+# alpha_val/EpisodeThresholdSchedule.threshold lives in env file (depends on k).

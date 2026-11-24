@@ -1,0 +1,21 @@
+# Policy traj encoder: feed-forward (memory-free).
+#
+# Uses :class:`amago.nets.traj_encoders.FFTrajEncoder`, a stack of residual
+# FF blocks that mirrors the structure of a transformer (residual + norm +
+# dropout) but without attention.  This is the cleanest 1:1 ablation of
+# "memory vs. no memory" against ``policy/tformer.gin``: same per-step
+# representation, same `max_seq_len` slot, no cross-timestep mixing.
+#
+# Architectural dimensions (d_model, n_layers, d_ff, dropout) live in the
+# env overlay under the ``agent/`` scope (e.g.
+# ``agent/FFTrajEncoder.d_model = 256, agent/FFTrajEncoder.n_layers = 2``
+# in env/coloredgrid.gin), which is set up to match the 2-layer 256d
+# transformer the policy/tformer.gin variant uses.
+#
+# Use when you want a memory-free baseline (fully Markov tasks, or the
+# attention-vs-no-attention ablation) without changing batch shape.
+
+import amago.nets.traj_encoders
+import metabfm.rl.zero_shot_rl
+
+TDJepa.traj_encoder_pi_type = @FFTrajEncoder

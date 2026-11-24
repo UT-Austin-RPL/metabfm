@@ -1,0 +1,9 @@
+import metabfm.rl.zero_shot_rl
+
+TDJepa.inference_mode = @ThompsonSampling()
+
+ThompsonSampling.sigma = 10.0
+ThompsonSampling.lam = 1.0
+ThompsonSampling.decay = 1.0
+ThompsonSampling.kappa = 0.0
+ThompsonSampling.resample = "per_step"

@@ -1,0 +1,30 @@
+from setuptools import find_packages, setup
+
+setup(
+    name="metabfm",
+    version="0.1.0",
+    author="Jake Grigsby",
+    author_email="grigsby@cs.utexas.edu",
+    license="MIT",
+    packages=find_packages(include=["metabfm", "metabfm.*"]),
+    package_data={"metabfm": ["rl/configs/**/*.gin"]},
+    python_requires=">=3.10",
+    install_requires=[
+        "amago",
+        "dmc_remastered",
+        "dm_control",
+        "mujoco",
+        "gin-config",
+        "gymnasium",
+        "gym",
+        "torch",
+        "numpy",
+        "einops",
+        "wandb",
+        "tqdm",
+        "imageio",
+        "imageio-ffmpeg",
+        "pillow",
+        "argcomplete",
+    ],
+)

@@ -1,0 +1,24 @@
+# β axis: OFF.
+#
+# β ≡ 0 across training and evaluation, n_betas = 1. The extrinsic
+# trajectory encoder is auto-skipped at TDJepa.__init__ when
+# beta_dist.max_value == 0, so this preset turns the agent into pure
+# intrinsic-reward Q_I (no extrinsic-reward leakage into the TD target,
+# no extrinsic encoder branch into the actor input).
+#
+# val_beta_schedule is also pinned to β=0 → max_value == 0, so
+# BilevelExperiment.evaluate_val skips the val-beta eval phase cleanly.
+#
+# Scopes (beta/, beta_val/) keep ConstantAlpha.value bindings independent
+# from alpha/*.gin counterparts.
+
+import metabfm.rl.zero_shot_rl
+
+TDJepa.beta_dist = @beta/ConstantAlpha()
+beta/ConstantAlpha.value = 0.0
+
+TDJepa.n_betas = 1
+
+TDJepa.val_beta_schedule = @beta_val/ConstantSchedule()
+beta_val/ConstantSchedule.dist = @beta_val/ConstantAlpha()
+beta_val/ConstantAlpha.value = 0.0

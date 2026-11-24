@@ -1,0 +1,129 @@
+# Env overlay: ColoredGrid (small profile).
+#
+# Applied LAST in the gin ladder by scripts/train_colorgrid.py. Owns ALL
+# architectural dimensions for the tdjepa / dynamics / intrinsic / policy /
+# critic axes plus env-specific parameters (max_seq_len, alpha threshold).
+#
+# ColoredGrid defaults: 5x5 grid, k=6, max_ep=50, trial length
+# 6*50+1 = 301; 360 leaves headroom for AMAGO padding.
+
+import metabfm.rl.zero_shot_rl
+import amago.nets.actor_critic
+
+# ---- Env params ------------------------------------------------------
+# A trial is k*max_ep + 1 = 6*50 + 1 = 301 steps; 360 leaves headroom for
+# AMAGO's padding.
+BilevelExperiment.max_seq_len = 360
+
+# Alpha schedule crossover (explore for the first half of the trial,
+# exploit the last half). Tracks the default k=6 used by
+# scripts/train_colorgrid.py. (batch_size inherits the env-agnostic default
+# of 32 from tdjepa/default.gin.)
+EpisodeThresholdSchedule.threshold = 3
+
+# ---- TDJepa shape ----------------------------------------------------
+TDJepa.phi_dim = 200
+TDJepa.psi_dim = 50
+TDJepa.phi_encoder_hidden_dim = 256
+TDJepa.psi_encoder_hidden_dim = 256
+TDJepa.phi_predictor_hidden_dim = 1024
+TDJepa.psi_predictor_hidden_dim = 1024
+TDJepa.reward_multiplier = 10.0
+# Sequence-length ladder for ColoredGrid:
+#   max_seq_len (=360) >= ac_seq_len (=96) >= mlp_seq_len (=32, in tdjepa/default.gin).
+# Dynamics learner + intrinsic reward run on max_seq_len; actor / intrinsic
+# critic see ac_seq_len; per-timestep MLPs see mlp_seq_len.
+TDJepa.ac_seq_len = 96
+Actor.d_hidden = 512
+
+# ---- Agent tstep / policy encoder dims -------------------------------
+agent/FFTstepEncoder.n_layers = 1
+agent/FFTstepEncoder.d_hidden = 64
+agent/FFTstepEncoder.d_output = 64
+agent/FFTstepEncoder.auto_scale = True
+
+agent/PolicyTstepEncoder.d_hidden = 256
+agent/PolicyTstepEncoder.d_output = 256
+
+# Policy traj encoder: 2-layer 256d 8-head transformer w/ RoPE positional
+# embeddings + FlashAttention sliding window of 64 (used when
+# policy/tformer.gin is selected). RoPE matches the legacy / good-NGU
+# convention; the dynamics tformer below also uses "rope" for parity.
+agent/TformerTrajEncoder.d_model = 256
+agent/TformerTrajEncoder.n_heads = 8
+agent/TformerTrajEncoder.n_layers = 2
+agent/TformerTrajEncoder.pos_emb = "rope"
+
+# Sliding-window attention on the policy encoder. Tuple is
+# (left_tokens, right_tokens); right=0 enforces causality. Only applies
+# to FlashAttention instances under the agent/ scope (i.e. the policy
+# transformer); phi/psi traj encoders are Identity.
+agent/FlashAttention.window_size = (64, 0)
+
+# FFTrajEncoder fallback dims (used when policy/ff.gin is the choice and
+# something pulls FFTrajEncoder under agent/; defaults from legacy).
+agent/FFTrajEncoder.d_model = 256
+agent/FFTrajEncoder.n_layers = 2
+
+# ---- Dynamics shape --------------------------------------------------
+DynamicsEncoder.dynamics_output_dim = 32
+DynamicsEncoder.idm_dim = 32
+DynamicsLearner.idm_hidden = 400
+DynamicsLearner.probe_hidden = 400
+
+dynamics/FFTstepEncoder.n_layers = 1
+dynamics/FFTstepEncoder.d_hidden = 64
+dynamics/FFTstepEncoder.d_output = 64
+
+dynamics/TformerTrajEncoder.d_model = 512
+dynamics/TformerTrajEncoder.n_heads = 8
+dynamics/TformerTrajEncoder.n_layers = 6
+# RoPE positional embeddings on the dynamics tformer (matches the agent /
+# policy side, and the legacy / good-NGU dynamics setup).
+dynamics/TformerTrajEncoder.pos_emb = "rope"
+
+# Full (causal) attention on the dynamics tformer; window_size=(-1, -1)
+# disables sliding-window attention and lets every token attend to all
+# preceding context, which matches the legacy / good-NGU dynamics setup.
+dynamics/FlashAttention.window_size = (-1, -1)
+
+# ---- Intrinsic critic shape ------------------------------------------
+# After the share-actor-encoder refactor the intrinsic critic reuses the
+# actor's policy_ctx (PolicyTstepEncoder + traj_encoder_pi above), so it
+# has no encoder dims of its own to bind.
+
+# E3B regularizer (only effective if e3b_coeff > 0; intrinsic/full.gin is
+# NGU-based by default and sets e3b_coeff=0.0). Override via --gin if you
+# resurrect an E3B-based intrinsic ladder for ColoredGrid.
+IntrinsicCriticStack.e3b_lambda = 1.0
+
+# RND on observed_normalized: linear decay 1.0 -> 0.0 over the first 50k
+# training steps. Applied across every ColoredGrid intrinsic variant.
+IntrinsicCriticStack.rnd_coeff = 1.0
+IntrinsicCriticStack.rnd_coeff_final = 0.0
+IntrinsicCriticStack.rnd_coeff_decay_steps = 50000
+
+# ---- Reward multipliers (intrinsic / extrinsic on env-natural scale) ─
+# Both channels are kept at 1.0 so the NCriticsTwoHot bin range below
+# directly maps to raw env-scale Q values.  TDJepa.reward_multiplier
+# above (=10.0) is the orthogonal *z-inference / SF reward target*
+# scale, for which Thompson sampling sigma is independently tuned.
+IntrinsicCriticStack.reward_multiplier = 1.0
+TDJepa.extrinsic_reward_multiplier = 1.0
+
+# ---- NCriticsTwoHot bin range (intrinsic critic) ─────────────────────
+# Categorical critic over a fixed bin support.  ColoredGrid per-cell
+# rewards are Normal(0, 3) clipped to [-10, 10]; at gamma=0.99 over
+# ~50 steps the discounted return per episode lies roughly in
+# [-400, 400].  We widen the upper bound to 600 to leave headroom for
+# the higher-gamma SF heads / k-episode meta-trial accumulation, and
+# leave the lower bound at -400 (no need for symmetry — most policies
+# spend most of their time in the positive half).  64 bins keeps the
+# bin width tight (~16 raw-units / bin) without bloating compute.
+intrinsic/NCriticsTwoHot.min_return  = -400.0
+intrinsic/NCriticsTwoHot.max_return  = 600.0
+intrinsic/NCriticsTwoHot.output_bins = 64
+intrinsic/NCriticsTwoHot.use_symlog  = False
+intrinsic/NCriticsTwoHot.init_value  = 0.0
+intrinsic/NCriticsTwoHot.d_hidden    = 300
+intrinsic/NCriticsTwoHot.n_layers    = 2

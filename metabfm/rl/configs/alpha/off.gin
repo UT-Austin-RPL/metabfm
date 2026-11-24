@@ -1,0 +1,23 @@
+# α axis: OFF.
+#
+# α ≡ 0 across training and evaluation, n_alphas = 1. The intrinsic critic
+# stack is auto-skipped at TDJepa.__init__ when alpha_dist.max_value == 0,
+# so this preset turns the agent into pure SF / V_td (vanilla ZSRL or
+# dyncs_zsrl, depending on the dynamics overlay).
+#
+# val_alpha_schedule is also pinned to α=0 → max_value == 0, so
+# BilevelExperiment.evaluate_val skips the val-alpha eval phase cleanly.
+#
+# Scopes (alpha/, alpha_val/) keep ConstantAlpha.value bindings independent
+# from beta/*.gin counterparts (which use beta/, beta_val/).
+
+import metabfm.rl.zero_shot_rl
+
+TDJepa.alpha_dist = @alpha/ConstantAlpha()
+alpha/ConstantAlpha.value = 0.0
+
+TDJepa.n_alphas = 1
+
+TDJepa.val_alpha_schedule = @alpha_val/ConstantSchedule()
+alpha_val/ConstantSchedule.dist = @alpha_val/ConstantAlpha()
+alpha_val/ConstantAlpha.value = 0.0

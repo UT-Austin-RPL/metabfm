@@ -1,0 +1,56 @@
+# DynamicsLearner: latent IDM + LDP (the "full method" dynamics option).
+#
+# Trains BOTH an inverse dynamics model (IDM) and a latent dynamics
+# prediction (LDP) head against the per-timestep encoder target ("tstep").
+# Probes are detached (diagnostic only). skip_prev_target=True lets the
+# prediction heads consume the previous timestep's target as an additional
+# input, focusing them on modeling state transitions and enabling a smaller
+# dynamics_output_dim (set in env overlay).
+#
+# Subsumes the legacy dynamics/training/{default,detached}.gin behaviors.
+# Architectural dimensions (transformer width / depth, tstep encoder sizes,
+# dynamics_output_dim, idm_dim) live in the env overlay.
+
+import metabfm.rl.dynamics_learner
+import amago.nets.tstep_encoders
+import amago.nets.traj_encoders
+
+BilevelExperiment.dynamics_learner_type = @DynamicsLearner
+
+DynamicsLearner.tstep_encoder_type = @FFTstepEncoder
+DynamicsLearner.traj_encoder_type = @DynamicsEncoder
+DynamicsEncoder.dynamics_encoder_type = @TformerTrajEncoder
+DynamicsEncoder.sphere_normalize = True
+DynamicsEncoder.idm_sphere_normalize = True
+
+# sigma_reparam off for the dynamics tformer (launch-time parity with the
+# overnight KS matrix on the remote machine).
+dynamics/TformerTrajEncoder.sigma_reparam = False
+
+# Skip-connection prediction heads: pass the previous timestep's target into
+# the dynamics_g / obs_probe_next / idm_head networks alongside the current
+# trajectory feature. Lets us shrink dynamics_output_dim aggressively.
+DynamicsLearner.skip_prev_target = True
+
+# Train both heads.
+DynamicsLearner.idm_coeff = 1.0
+DynamicsLearner.ldp_coeff = 1.0
+DynamicsLearner.ldp_target = "tstep"
+# Orthogonality regularizer disabled by default per the phase3 ablation. The
+# regularized variant cost a clear ~5% asymptotic return on ColoredGrid and
+# did not help the dynamics objective. Re-enable for sweeps via
+# `--overlay dynamics/with_ortho`.
+DynamicsLearner.ldp_ortho_coeff = 0.0
+DynamicsLearner.ldp_ema_tau = 0.005
+
+# Probes are detached from the dynamics encoder gradient (diagnostic only;
+# the encoder is shaped exclusively by the LDP loss).
+DynamicsLearner.detach_probes = True
+
+# Dynamics-side tstep encoder consumes raw observations + actions and runs
+# its own InputNorm. The resulting normalized observation is published to
+# downstream consumers as obs["observed_normalized"].
+dynamics/FFTstepEncoder.specify_obs_keys = ["observed", "prev_action"]
+dynamics/FFTstepEncoder.normalize_inputs = True
+dynamics/FFTstepEncoder.hide_rl2s = True
+dynamics/FFTstepEncoder.auto_scale = True

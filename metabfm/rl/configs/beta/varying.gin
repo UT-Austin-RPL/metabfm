@@ -1,0 +1,60 @@
+# β axis: VARYING.
+#
+# β ~ ZeroInflatedUniform([0, 1]) with 20% mass at β=0 (pure intrinsic
+# Q_I — no extrinsic leakage) and 20% mass at β=1 (pure extrinsic, scaled
+# by extrinsic_reward_multiplier). Remaining 60% is uniform on (0, 1).
+# n_betas = 3 keeps the cross-product slot count manageable when paired
+# with alpha/varying.gin (3 × 3 = 9 slots) while still allowing endpoint
+# pinning at β=0 and β=1 inside compute_losses.
+#
+# val_beta_schedule = EpisodeThresholdSchedule fired at α=1: explore at
+# β=high during the first ``threshold`` episodes of each trial, exploit
+# at β=low afterwards. ``threshold`` is bound per env overlay.
+#
+# Also binds the extrinsic_traj_encoder hyperparameters under the
+# ``extrinsic/`` gin scope (matches the gin.config_scope used at
+# TDJepa.__init__ around line 3566). Default = 2-layer 256-d transformer
+# with RoPE positional embedding, mirroring the policy/tformer.gin
+# defaults sized to the env overlay.
+#
+# Scopes (beta/, beta_val/) keep ZeroInflatedUniform / EpisodeThreshold
+# bindings independent from alpha/*.gin counterparts.
+
+import metabfm.rl.zero_shot_rl
+import metabfm.rl.extrinsic_encoder
+import amago.nets.traj_encoders
+import amago.nets.transformer
+
+TDJepa.beta_dist = @beta/ZeroInflatedUniform()
+beta/ZeroInflatedUniform.max_value = 1.0
+beta/ZeroInflatedUniform.p_zero = 0.2
+beta/ZeroInflatedUniform.p_one = 0.2
+
+TDJepa.n_betas = 3
+
+# val-beta phase: β = 1 for ALL eval episodes. (We do NOT mirror the
+# alpha "explore-then-exploit" EpisodeThresholdSchedule on the β axis
+# because the val-beta phase pins α=1, which means the actor never
+# consults the SF/BLR-z stream regardless of β. The "exploit by
+# dropping β" semantics — defer to z once enough novelty has been
+# gathered — collapses to "let the actor chase intrinsic novelty
+# instead of the goal" at α=1, which actively hurts Wind/goal-seeking
+# returns. Constant β=1 keeps val-beta as a faithful "AMAGO-style
+# extrinsic-driven" eval.)
+TDJepa.val_beta_schedule = @beta_val/ConstantSchedule()
+beta_val/ConstantSchedule.dist = @beta_val/ConstantAlpha()
+beta_val/ConstantAlpha.value = 1.0
+
+# Extrinsic-reward branch: tstep encoder + traj encoder + reward scale.
+TDJepa.extrinsic_reward_multiplier = 1.0
+TDJepa.extrinsic_tstep_encoder_type = @ExtrinsicTstepEncoder
+TDJepa.extrinsic_traj_encoder_type = @extrinsic/TformerTrajEncoder
+
+ExtrinsicTstepEncoder.tstep_dim = 128
+ExtrinsicTstepEncoder.n_layers = 1
+ExtrinsicTstepEncoder.d_hidden = 128
+
+extrinsic/TformerTrajEncoder.d_model = 256
+extrinsic/TformerTrajEncoder.n_layers = 2
+extrinsic/TformerTrajEncoder.n_heads = 4
+extrinsic/TformerTrajEncoder.pos_emb = "rope"

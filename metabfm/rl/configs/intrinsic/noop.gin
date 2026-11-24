@@ -1,0 +1,13 @@
+# Intrinsic critic: NO-OP variant.
+#
+# TDJepa's default alpha_dist (ConstantAlpha(0.0)) keeps IntrinsicCriticStack
+# from being constructed.
+#
+# Drop ``intrinsic_reward`` from the policy tstep encoder: with no intrinsic
+# stack the actor has no meaningful intrinsic reward signal. Keep
+# ``observed_normalized`` + ``prev_action`` so the actor can still condition
+# on the raw state alongside phi (which is concatenated unconditionally).
+
+import metabfm.rl.policy_tstep
+
+agent/PolicyTstepEncoder.specify_obs_keys = ["prev_action", "observed_normalized"]

@@ -1,0 +1,67 @@
+# Intrinsic critic: full method (NGU episodic kNN + decayed RND).
+#
+# Default full intrinsic-stack composition. NGU's strict-prefix episodic kNN
+# bonus over the composite [dyn_tstep_emb, idm] feature drives the per-step
+# novelty signal; RND on observed_normalized is added on top with a linear
+# decay to 0 (additive, env-tuned via rnd_coeff_decay_steps).
+#
+# E3B and rldp_error reward channels are explicitly disabled here; envs may
+# re-enable them via overlay if a study calls for it. The NGU kNN/kernel
+# constants (ngu_k, ngu_c, ngu_kernel_eps, ngu_cluster_distance,
+# ngu_max_similarity) are intentionally NOT bound — they fall back to the
+# IntrinsicCriticStack constructor defaults (NGU paper values: k=10,
+# c=0.001, kernel_eps=1e-4, cluster_distance=0.008, max_similarity=8.0).
+# Env overlays that need tighter discrimination for low-D feature spaces
+# (e.g. env/wind.gin) override these in-place.
+#
+# After the share-actor-encoder refactor, IntrinsicCriticStack no longer
+# owns its own tstep/traj encoder; it consumes the actor's policy_ctx
+# (output of PolicyTstepEncoder + traj_encoder_pi) directly. See
+# agent/tdjepa.gin's PolicyTstepEncoder.specify_obs_keys for the shared
+# encoder's input set.
+#
+# This file is the PURE intrinsic-stack composition — α-axis bindings
+# (alpha_dist, n_alphas, val_alpha_schedule) and TDJepa.normalize_q live
+# in alpha/*.gin so they can be selected independently per baseline.
+
+import metabfm.rl.zero_shot_rl
+
+# Q-value normalization is required when α > 0 to keep Q_I from dominating
+# V_combined. alpha/varying.gin and alpha/pinned_intrinsic.gin both rely
+# on this, so it lives here at the intrinsic-stack composition layer.
+TDJepa.intrinsic_critic_loss_weight = 1.0
+TDJepa.normalize_q = True
+TDJepa.sf_loss_weight = 1.0
+
+# ---- IntrinsicCriticStack ---------------------------------------------
+IntrinsicCriticStack.num_critics = 2
+IntrinsicCriticStack.tau = 0.005
+IntrinsicCriticStack.n_step = 1
+# Larger reward multiplier rebalances the intrinsic critic against
+# extrinsic returns (matches our pre-refactor 10x setting).
+IntrinsicCriticStack.reward_multiplier = 10.0
+IntrinsicCriticStack.use_z_in_critic = True
+
+# NGU (strict-prefix kNN over a composite state + trajectory-context feature).
+#
+# Composite feature: [dyn_tstep_emb, idm]. The "idm" key is misleading —
+# under the current dynamics learner, idm is the per-timestep trajectory-
+# context variable (incentivized to summarize the trajectory, not just the
+# current state). dyn_tstep_emb is the per-timestep state embedding, which
+# is what the NGU paper uses as the kNN feature. We concatenate both so
+# the kNN distance has access to a state feature AND a trajectory-context
+# feature; rldp is intentionally omitted (redundant with idm).
+IntrinsicCriticStack.e3b_coeff = 0.0
+IntrinsicCriticStack.ngu_coeff = 1.0
+IntrinsicCriticStack.ngu_feature_key = ["dyn_tstep_emb", "idm"]
+
+# RND on the dynamics learner's pre-normalized observation; decayed to 0
+# linearly. Total decay step count (rnd_coeff_decay_steps) is env-specific
+# and is bound in the env overlay.
+IntrinsicCriticStack.rnd_obs_key = "observed_normalized"
+IntrinsicCriticStack.rnd_output_expansion = 1
+IntrinsicCriticStack.rnd_coeff = 1.0
+IntrinsicCriticStack.rnd_coeff_final = 0.0
+
+# rldp_error reward source disabled — NGU + decayed RND is the spec.
+IntrinsicCriticStack.rldp_error_coeff = 0.0

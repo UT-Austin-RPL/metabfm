@@ -1,0 +1,211 @@
+# TDJepa method core — env-agnostic.
+#
+# Subsumes the relevant pieces of the legacy agent/training/default.gin and
+# agent/tdjepa.gin. All architectural dimensions (phi/psi sizes, hidden dims,
+# Actor.d_hidden, ac_seq_len, reward_multiplier, etc.) live in the env overlay
+# (env/coloredgrid.gin or env/metaworld.gin), applied LAST in the gin ladder.
+#
+# Encoder *class* choices are split out:
+#   * tstep encoder for phi/psi backbones is an FFTstepEncoder here
+#     (the only thing TDJepa needs at the per-timestep level).
+#   * traj_encoder_type / traj_encoder_b_type are Identity here (per-timestep
+#     losses don't benefit from a traj encoder on phi/psi).
+#   * traj_encoder_pi_type is NOT bound here — it comes from policy/{ff,tformer}.gin.
+#
+# Observation keys: TDJepa now consumes the dynamics learner's normalized
+# observation (observed_normalized) directly, so InputNorm is OFF on the
+# agent-side FFTstepEncoder.
+#
+# α-β conditioning: ``fourier_n_freq`` controls the Fourier basis used to
+# encode the per-slot α and β scalars before they enter the actor and Q_I
+# MLP heads. ``2 * fourier_n_freq + 1`` dims per scalar, 66 dims total at
+# the default n_freq=16. α / β distributions, schedules, and slot counts
+# live under alpha/*.gin and beta/*.gin (the new flat preset structure).
+
+import metabfm.rl.zero_shot_rl
+import amago.agent
+import amago.nets.tstep_encoders
+import amago.nets.traj_encoders
+import amago.nets.actor_critic
+
+# ── Multigamma list (env-agnostic) ────────────────────────────────────────────
+# AMAGO's per-token gradient amplification trick: train Q_P (and the
+# matching actor heads) over a small set of bootstrap gammas in addition
+# to the deployment γ=0.99 (auto-appended to this list inside
+# ``BilevelAgent.__init__``).  Drops the high-end {0.97, 0.995} that
+# inflated TD target outliers and slowed scalar-popart convergence;
+# leaves a clean ladder [.1, .9, .95, .98, .99] where the deployment
+# head is well separated from the auxiliary regularizers.
+amago.agent.Multigammas.continuous = [0.1, 0.9, 0.95, 0.98]
+amago.agent.Multigammas.discrete   = [0.1, 0.9, 0.95, 0.98]
+
+# ── Default critic_type for IntrinsicCriticStack ──────────────────────────────
+# NCriticsTwoHot (categorical critic over a fixed bin range) is now the
+# global default for every baseline preset that constructs IC: covers
+# pure_extrinsic, intrinsic_meta_rl, metabfm_alpha, and metabfm_alphabeta.
+# Vanilla zsrl / dyncs_zsrl don't instantiate IC (α=β=off), so this
+# binding is harmless for them.  Per-env files (env/wind.gin,
+# env/metaworld.gin) set min_return / max_return / output_bins under
+# the same `intrinsic/` scope.
+IntrinsicCriticStack.critic_type = @intrinsic/NCriticsTwoHot
+
+BilevelExperiment.rl_agent_type = @TDJepa
+BilevelExperiment.learning_rate = 1e-4
+BilevelExperiment.batch_size = 32
+
+# Required by AMAGO Experiment base class (BilevelExperiment overrides
+# init_model and builds agents via gin, but the base stores these on self).
+BilevelExperiment.tstep_encoder_type = @FFTstepEncoder
+BilevelExperiment.traj_encoder_type = @FFTrajEncoder
+BilevelExperiment.agent_type = @Agent
+
+# Per-timestep encoder for phi/psi backbones (sizes set by env overlay).
+TDJepa.tstep_encoder_type = @FFTstepEncoder
+TDJepa.tstep_encoder_b_type = @FFTstepEncoder
+
+# phi/psi traj encoders are Identity (their losses are per-timestep).
+TDJepa.traj_encoder_type = @IdentityTrajEncoder
+TDJepa.traj_encoder_b_type = @IdentityTrajEncoder
+# traj_encoder_pi_type is intentionally unbound here; comes from policy/.
+
+# Observation keys for phi/psi backbone tstep encoders.
+# Consume the dynamics learner's pre-normalized observation plus rldp / idm.
+# rldp_error is omitted: it's only used as an intrinsic reward source inside
+# IntrinsicCriticStack, not as an encoder input.
+TDJepa.specify_obs_keys = ["observed_normalized", "rldp", "idm"]
+TDJepa.specify_obs_keys_b = ["observed_normalized", "rldp", "idm"]
+
+# Agent-side FFTstepEncoder normalization defaults.
+# normalize_inputs=False because observed_normalized is already z-scored by
+# the DynamicsLearner; rldp / idm are already sphere-normalized.
+agent/FFTstepEncoder.normalize_inputs = False
+agent/FFTstepEncoder.hide_rl2s = True
+
+# Policy tstep encoder: projects (phi, intrinsic_reward, prev_action,
+# observed_normalized) into a per-timestep feature consumed by
+# traj_encoder_pi.  After the share-actor-encoder refactor,
+# traj_encoder_pi's output (policy_ctx) is consumed by BOTH the actor
+# MLP and the intrinsic critic Q-heads.
+#
+# phi (which already encodes the SF-shaped state representation) is
+# concatenated unconditionally on top of these keys.  rldp / idm /
+# rldp_error are deliberately excluded from the policy path — rldp and
+# idm are already baked into phi, and rldp_error only matters as an
+# intrinsic reward signal (handled inside the IC stack).
+#
+# No InputNorm is applied inside this encoder. n_layers=2 since this is
+# the only learned per-step projection on the actor + IC side. Sizes
+# set by env; auto_scale=True clamps d_hidden / d_output upward to
+# in_dim if needed.
+agent/PolicyTstepEncoder.specify_obs_keys = [
+    "intrinsic_reward",
+    "prev_action",
+    "observed_normalized",
+]
+agent/PolicyTstepEncoder.n_layers = 2
+
+# α-β Fourier conditioning. n_freq=16 → 33 dims per scalar, 66 total for
+# α+β. Linear frequency spacing (k·π for k=1..n_freq) gives max freq =
+# n_freq cycles per unit interval, with the raw scalar appended as a
+# safety-net tail. See metabfm/rl/conditioning.py for design notes.
+TDJepa.fourier_n_freq = 16
+
+# Debug knob — when True, ``policy_ctx`` (TDJepa pi-traj-encoder
+# output) AND ``z`` (the BLR posterior task vector) are both zeroed at
+# every actor MLP and Q_I critic MLP input. The actor / Q_I therefore
+# see only ``[α_enc, β_enc, gated_ext]`` plus zero-padding, making
+# ``pure_extrinsic`` (α=β=1) a faithful AMAGO baseline that is provably
+# independent of TDJepa SF / BLR features. (z is zeroed alongside
+# policy_ctx because z only carries task signal when paired with the
+# SF-shaped policy_ctx stream — leaving random z noise in the input
+# would defeat the AMAGO-faithfulness guarantee.) TDJepa SF / phi / psi
+# training still runs; only its propagation into the actor/critic heads
+# is suppressed. Override to True via --gin "TDJepa.zero_policy_ctx=True"
+# when you want this guarantee.
+TDJepa.zero_policy_ctx = False
+
+# Loss / training defaults (env-agnostic). Sizes (phi_dim, psi_dim, etc.)
+# and reward_multiplier / ac_seq_len are overridden by the env overlay.
+# offline_coeff is now universal at 0.0 (the offline term consistently
+# regressed online performance on ColoredGrid; metaworld / ant share the
+# same default unless overridden in their env file).
+# detach_actor is universal across envs and lives here.
+# Deployment / test-time gamma γ_i for the actor + intrinsic critic Q_P
+# (last slot of self.gammas; also the actor head used at rollout via
+# get_actions). Matches AMAGO's default deployment gamma.
+TDJepa.gamma = 0.99
+# SF-side gamma γ_sf for phi/psi/maximized_phi/target_* predictors
+# (single-element self.sf_gammas). Trained to model V^{π_{γ_i}, γ_sf}:
+# the SF Bellman backup uses π_{γ_i}'s actions but discounts at γ_sf.
+# Picking γ_sf < γ_i = 0.99 (TDJepa default 0.97) lowers the SF
+# bootstrap variance and accelerates Bellman contraction without
+# changing what policy is being represented; the V_combined actor
+# objective then becomes a short-horizon SF anchor (~33-step value
+# under γ_sf=0.97) blended via α with a long-horizon Q_P (~100-step
+# value under γ_i=0.99). Override to 0.99 to recover the previous
+# single-gamma behavior.
+TDJepa.sf_gamma = 0.97
+TDJepa.tau = 0.005
+TDJepa.num_critics = 2
+TDJepa.num_critics_td = 2
+TDJepa.online_coeff = 1.0
+TDJepa.offline_coeff = 0.0
+# Corner pin: during collection, a fixed 25% of actors roll out at the
+# pure-extrinsic (α=1, β=1) corner for the whole meta-trial. Only active
+# when both α and β vary (metabfm_alphabeta); a no-op for every other preset.
+# Bound here, not in env overlays or --gin, so it cannot differ by domain.
+TDJepa.pin_pure_extrinsic_fraction = 0.25
+TDJepa.sf_loss_weight = 1.0
+# Paper-scale orthogonality coefficient: directly comparable to reference
+# TDJepa's `phi_ortho_coef` / `psi_ortho_coef`. Reference DMC launch uses 0.1
+# (Table 5 best); reference agent default is 1.0 (Table 4 default). The agent
+# rescales internally by 1/2 into `_effective_fb_ortho_coeff` to compensate
+# for the single 0.5 prefactor in our TD reduction (see TDJepa.__init__).
+# After the fix, this value transfers directly between domains and matches
+# reference at the same numeric setting; ColoredGrid empirically wants more
+# than DMC's 0.1 (re-tune from the {0.1, 0.5, 1.0, 5.0, 10.0} grid).
+TDJepa.fb_ortho_coeff = 0.1
+# Cross-trajectory ortho only: every off-diagonal cov entry is between
+# representations from *different* trajectories, matching reference's
+# per-step minibatch-of-independent-samples semantics. The previous default
+# `"all"` also penalized within-trajectory pairs, which fights the temporal
+# smoothness that TD/LDM are simultaneously trying to learn — that double-
+# penalty was one of the reasons the user-facing coefficient previously had
+# to be cranked far above paper-scale.
+TDJepa.ortho_mode = "cross_traj"
+TDJepa.z_goal_ratio = 0.33
+TDJepa.z_reward_ratio = 0.0
+TDJepa.z_reward_intermediate = True
+TDJepa.reward_regression_coeff = 0.0
+TDJepa.random_ensembling = True
+TDJepa.mlp_seq_len = 32
+TDJepa.normalize_q = False
+# Multigamma actor + Q_P (single-gamma SF). Adopts AMAGO's per-token
+# gradient amplification on the cheap heads (actor MLP +
+# IntrinsicCriticStack with PopArt) by training over G_q heads; SF
+# predictors stay at G_sf=1 so phi/psi cost doesn't scale with G_q.
+# The deployment policy π_{γ_i} (actor head g=-1) drives both
+# rollout and the SF Bellman backup target action.
+TDJepa.use_multigamma = True
+# Stop the actor's gradient from flowing back through phi/psi. The phi/psi
+# backbones are shaped by the SF / FB-ortho losses; letting the policy MLP
+# also gradient-update them tends to collapse representations on small envs.
+TDJepa.detach_actor = True
+
+# Predictor architecture: reference TDJepa-style two-tower predictor
+# (`_EinMixTwoTower`). Two independent embedding pathways for (state, z, gamma)
+# and (state, action, gamma); each tower outputs d_hidden//2; concatenated
+# and run through a shared trunk. Mirrors `ForwardMap` /  `simple_embedding`
+# in reference_codebases/td_jepa/metamotivo/nn_models.py:208-242,199-205.
+#
+# Depth knobs match paper Table 4 DMC defaults
+#   (SFs hidden_layers=3 = embedding_layers(2) + hidden_layers(1)):
+#     tower_layers=2 -> 2 Linears per tower (input + tower-output, no middle)
+#     trunk_layers=1 -> 1 trunk hidden Linear + final output Linear = 2 trunk Linears
+# Width: phi_predictor_hidden_dim / psi_predictor_hidden_dim = 1024 (default).
+# Override per env if you want the OGBench-deeper trunk (trunk_layers=2,
+# hidden_dim=512) or to A/B back to the fused MLP (two_tower=False).
+JepaPredictor.two_tower = True
+JepaPredictor.tower_layers = 2
+JepaPredictor.trunk_layers = 1
+JepaPredictor.input_pre_norm = True

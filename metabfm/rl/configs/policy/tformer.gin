@@ -1,0 +1,20 @@
+# Policy traj encoder: causal transformer.
+#
+# Gives the actor in-context memory over the per-timestep PolicyTstepEncoder
+# features for non-Markovian reward signals (intrinsic_reward, novelty).
+# Architectural dimensions (d_model, n_heads, n_layers, pos_emb,
+# FlashAttention.window_size) live in the env overlay.
+
+import amago.nets.traj_encoders
+import amago.nets.transformer
+import metabfm.rl.zero_shot_rl
+
+TDJepa.traj_encoder_pi_type = @TformerTrajEncoder
+
+# sigma_reparam off by default; env can override.  AMAGO's
+# TformerTrajEncoder.sigma_reparam defaults to True; explicitly disable
+# in EVERY active scope so the policy / extrinsic transformer stack uses
+# stock LayerNorm + Linear without the SigmaReparam wrapper (avoids the
+# extra spectral-normalization parameter and matches the agent/ scope).
+agent/TformerTrajEncoder.sigma_reparam = False
+extrinsic/TformerTrajEncoder.sigma_reparam = False

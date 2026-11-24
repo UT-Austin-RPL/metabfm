@@ -1,0 +1,196 @@
+# Env overlay: Wind (2-D point robot meta-RL).
+#
+# Applied LAST in the gin ladder by scripts/train_wind.py. Owns ALL architectural
+# dimensions for the tdjepa / dynamics / intrinsic / policy / critic axes
+# plus env-specific parameters (max_seq_len, alpha threshold, RND sizing).
+#
+# Design notes:
+#   * The task is a 2-D point robot in a hidden constant wind field; the
+#     agent must reach a fixed goal (0, 1) within a sparse goal-radius
+#     disk. State is just (x, y) plus a soft-reset flag (3-D total).
+#   * Cross-task variation is a single 2-D wind vector; no contact
+#     dynamics, no rich obs. The dynamics encoder is small (d=128, L=3,
+#     sliding window 16) and rldp / idm projections are tiny 4-D.
+#     dyn_tstep_emb is 64-D to keep E3B saturation slow enough for useful
+#     exploration signal.
+#   * Sequence ladder is sized to fit a k_train=3 trial:
+#     max_seq_len = 75 * 3 + 1 = 226. ac_seq_len = 128 covers ~1.5 inner
+#     episodes; mlp_seq_len = 32 stays at the default. With k_eval=10, the
+#     policy sees rolling 226-step windows of the 751-step eval trial.
+#   * RND targets `state_pos` (the (x, y) position, 2-D), exposed by
+#     WindDictObs (see metabfm/rl/wind.py).
+#
+# Sources combined here:
+#   * env/ant_wind.gin     (closest analog: low-D continuous nav, k-ep meta-RL,
+#                          sparse reward, RND on state_pos)
+#   * env/coloredgrid.gin  (e3b_lambda, rnd decay)
+
+import metabfm.rl.zero_shot_rl
+import amago.nets.actor_critic
+
+# ---- Env params ------------------------------------------------------
+# Sized to fit a k_train=3 *training* trial: max_episode_steps * k + 1
+# = 75*3+1 = 226.
+BilevelExperiment.max_seq_len = 226
+
+# α eval schedule: explore at α=high during eps 0..2, exploit at α=low at
+# ep 3+. With --k_eval_episodes=10 (default), the policy explores via
+# intrinsic Q_I for the first 3 of 10 inner episodes (mirrors AMAGO-style
+# "burn 3 episodes identifying the wind, then chase the goal for 7"), then
+# switches to SF / V_td for the remaining 7. With --k_train_episodes=3
+# (default), every training inner episode runs in α=1 (explore) mode.
+# (β-axis val schedule is now constant β=1 in beta/varying.gin — see the
+# comment there for why "explore-then-exploit" semantics don't apply when
+# α=1 pins out the SF/BLR-z stream.)
+alpha_val/EpisodeThresholdSchedule.threshold = 3
+
+# ---- TDJepa shape ----------------------------------------------------
+TDJepa.phi_dim = 160
+TDJepa.psi_dim = 40
+TDJepa.phi_encoder_hidden_dim = 256
+TDJepa.psi_encoder_hidden_dim = 256
+TDJepa.phi_predictor_hidden_dim = 800
+TDJepa.psi_predictor_hidden_dim = 800
+TDJepa.reward_multiplier = 10.0
+# EMA rate for phi/psi target networks (AMAGO Agent default = 0.003).
+# Separate from IntrinsicCriticStack.tau (0.005 from intrinsic/full.gin).
+TDJepa.tau = 0.003
+# Sequence-length ladder for Wind:
+#   max_seq_len (=226) = max_episode_steps (75) * k_train_episodes (3) + 1
+#   ac_seq_len  (=128) covers ~1.7 inner episodes for actor + IC critic
+#   mlp_seq_len (= 24) per-timestep MLP window — keeps phi/psi MLP compute
+#                       cheap on the smaller per-step features.
+TDJepa.ac_seq_len = 128
+TDJepa.mlp_seq_len = 24
+TDJepa.fb_ortho_coeff = 0.25
+# Fourier basis for α / β conditioning. n_freq=8 → 17 dims per scalar
+# (8 sin + 8 cos + 1 raw), 34 total for α + β. Wind only uses a 3×3 grid
+# of α / β values with corners pinned at 0 and 1, so the default n_freq=16
+# is overkill — n_freq=8 cleanly distinguishes those slots while keeping
+# the actor / Q_I MLP inputs leaner.
+TDJepa.fourier_n_freq = 8
+
+# ---- Actor / Critic hidden dims --------------------------------------
+Actor.d_hidden = 300
+NCritics.d_hidden = 300
+intrinsic/NCritics.d_hidden = 300
+
+# ---- Agent tstep / policy encoder dims -------------------------------
+# phi/psi backbone tstep encoder (small — obs is 3-D).
+agent/FFTstepEncoder.n_layers = 1
+agent/FFTstepEncoder.d_hidden = 128
+agent/FFTstepEncoder.d_output = 128
+agent/FFTstepEncoder.auto_scale = True
+
+# Policy tstep encoder: keeps 256 — this is the main per-step projection
+# for the actor + IC path (phi + intrinsic_reward + prev_action + rldp +
+# idm + observed_normalized + rldp_error).
+agent/PolicyTstepEncoder.d_hidden = 256
+agent/PolicyTstepEncoder.d_output = 256
+
+# Policy traj encoder: 2-layer 256d 4-head transformer w/ RoPE.
+agent/TformerTrajEncoder.d_model = 256
+agent/TformerTrajEncoder.n_heads = 4
+agent/TformerTrajEncoder.n_layers = 2
+agent/TformerTrajEncoder.pos_emb = "rope"
+
+# Full causal attention (no sliding window). Mandatory for cross-episode
+# meta-RL identification on Wind: each inner episode is 75 steps, so with
+# k>=2 the policy must attend back into episode 0 to identify the wind.
+agent/FlashAttention.window_size = (-1, -1)
+
+# FFTrajEncoder fallback dims (used when policy/ff.gin is the choice).
+agent/FFTrajEncoder.d_model = 256
+agent/FFTrajEncoder.n_layers = 2
+
+# ---- Extrinsic encoder overrides (β branch) --------------------------
+# The extrinsic traj encoder is smaller than the main policy encoder for
+# Wind: 128d 2-layer transformer. Tstep encoder stays at 128d (default).
+extrinsic/TformerTrajEncoder.d_model = 128
+extrinsic/TformerTrajEncoder.n_heads = 4
+extrinsic/TformerTrajEncoder.n_layers = 2
+extrinsic/TformerTrajEncoder.pos_emb = "rope"
+
+# ---- Dynamics shape --------------------------------------------------
+# rldp / idm projections: 4-D each (minimal — the information content of
+# a 2-D wind vector doesn't justify larger trajectory-context variables).
+DynamicsEncoder.dynamics_output_dim = 4
+DynamicsEncoder.idm_dim = 4
+DynamicsLearner.idm_hidden = 128
+DynamicsLearner.probe_hidden = 128
+DynamicsLearner.ldp_g_hidden = 128
+
+# dyn_tstep_emb = 64: the dominant dimension for E3B composite feature
+# (64 + 4 = 68-D). Larger than the prior 32-D to slow E3B saturation.
+# d_hidden stays compact (64) — the obs is only 3-D so a wide hidden
+# isn't justified; output dim is the lever that drives E3B saturation.
+dynamics/FFTstepEncoder.n_layers = 2
+dynamics/FFTstepEncoder.d_hidden = 64
+dynamics/FFTstepEncoder.d_output = 64
+
+# Dynamics tformer: 2-layer 128d 4-head with RoPE and a tight 16-step
+# sliding window.
+dynamics/TformerTrajEncoder.d_model = 128
+dynamics/TformerTrajEncoder.n_heads = 4
+dynamics/TformerTrajEncoder.n_layers = 2
+dynamics/TformerTrajEncoder.pos_emb = "rope"
+
+dynamics/FlashAttention.window_size = (16, 0)
+
+# ---- Intrinsic reward tuning ----------------------------------------
+# Reward multipliers: scale intrinsic and extrinsic reward channels in
+# the Q_I TD target independently.  Reverted to 1.0 to match the
+# NCriticsTwoHot bin range below — the bins are calibrated to raw
+# environment reward, so doubling either channel would push
+# steady-state TD targets to the top bin and saturate gradients.
+# (TDJepa.reward_multiplier stays at 10.0 because it controls
+# z-inference / SF reward target scale, for which Thompson sampling
+# sigma is independently tuned.)
+IntrinsicCriticStack.reward_multiplier = 1.0
+TDJepa.extrinsic_reward_multiplier = 1.0
+
+# ---- NCriticsTwoHot bin range (intrinsic critic) --------------------
+# Categorical critic over a fixed bin support.  Sized for the empirical
+# Wind value scale at multipliers=1.0:
+#   * Pure-extrinsic baseline (at ext_mult=2.0) shows V_ext mean ≈ 220
+#     with single-sample max ≈ 750 (max almost certainly the γ=0.995
+#     auxiliary cell, since the deployment γ=0.99 mean is well below).
+#   * Rescale to mult=1.0: V_ext mean ≈ 110, single-sample max ≈ 250
+#     after the multigamma trim (drops {0.97, 0.995}).
+#   * Intrinsic V (NGU + E3B + RND) post-convergence at mult=1.0 settles
+#     around 100-200; combined α=1, β=1 worst case ≈ 350-450.
+# 64 bins over [-50, +400] gives ~7-unit raw-scale resolution at the
+# active region while leaving headroom for early-training spikes to
+# saturate the top bin without corrupting cross-entropy gradients.
+intrinsic/NCriticsTwoHot.min_return  = -50.0
+intrinsic/NCriticsTwoHot.max_return  = 400.0
+intrinsic/NCriticsTwoHot.output_bins = 64
+intrinsic/NCriticsTwoHot.use_symlog  = False
+intrinsic/NCriticsTwoHot.init_value  = 0.0
+intrinsic/NCriticsTwoHot.d_hidden    = 300
+intrinsic/NCriticsTwoHot.n_layers    = 2
+
+# NGU on Wind: tighter neighbor-discrimination than the literature default.
+# Effective in the default ladder (intrinsic/full.gin is NGU-based and
+# leaves these constants unbound, so this overlay's values win).
+#
+# Justification (NGU diversity probe on trained Wind checkpoints):
+# Wind's 2-D state space + smooth 0.05/step continuous motion makes the
+# NGU defaults (cluster_distance=0.008, kernel_eps=1e-4 — calibrated for
+# Atari-scale CNN features) too forgiving. Cross-episode-coverage paired
+# (DIVERSE − SAME) Δ at trained checkpoint:
+#     default            (k=10, cd=0.008, ke=1e-4): 175  (DIV/SAME=2.21)
+#     k=10, cd=0.001, ke=1e-5                    : 1568 (DIV/SAME=3.53)
+# Tightening cluster_distance (8x) and sharpening kernel_eps (10x) gives a
+# ~1.6x gain in DIV/SAME ratio for the same NGU memory + features.
+# k stays at 10 (literature-conventional, smoother per-step density estimate).
+IntrinsicCriticStack.ngu_cluster_distance = 0.001
+IntrinsicCriticStack.ngu_kernel_eps = 1e-5
+
+# ---- RND on state_pos ------------------------------------------------
+# state_pos is only 2-D, so expansion factors give 2->64->64->32.
+IntrinsicCriticStack.rnd_obs_key = "state_pos"
+IntrinsicCriticStack.rnd_hidden_expansion = 32.0
+IntrinsicCriticStack.rnd_output_expansion = 16.0
+IntrinsicCriticStack.rnd_n_layers = 2
+IntrinsicCriticStack.rnd_coeff_decay_steps = 50000

@@ -1,0 +1,195 @@
+# Env overlay: DMC Remastered walker (state-based, randomized embodiment).
+#
+# Applied LAST in the gin ladder by scripts/train_dmc_walker.py. Owns ALL architectural
+# dimensions for the tdjepa / dynamics / intrinsic / policy / critic axes plus
+# env-specific parameters (max_seq_len, alpha threshold).
+#
+# Design notes:
+#   * DMCRWalkerMeta: 25-D obs (24-D walker proprioceptive state + soft-reset
+#     flag), 6-D continuous action. Embodiment (torso / foot geometry, knee /
+#     ankle ranges, motor damping / armature, ground friction) is resampled per
+#     meta-trial from a dynamics seed and held fixed across the trial's k
+#     episodes, so the hidden task is the *body*, not the reward.
+#   * Sizes derive from env/hcvel.gin -- the closest existing domain (mujoco
+#     continuous control, 6-D action, k=2 meta-trials) -- with the extrinsic
+#     traj encoder at d_model=400 and the policy traj encoder at 320.
+#   * SF-side settings (phi_dim / psi_dim / predictor widths) follow the TD-JEPA
+#     paper's DMC proprio configuration. Under the pure_extrinsic baseline they
+#     are inert (see TDJepa.zero_policy_ctx below); they start mattering at the
+#     metaBFM phase.
+
+import metabfm.rl.zero_shot_rl
+import amago.nets.actor_critic
+
+# ---- Env params ------------------------------------------------------
+# A k=2 trial is max_episode_steps * k + 1 = 250*2 + 1 = 501 steps (250 actor
+# steps x frame_skip=2 = 500 control steps per episode). The policy sees a
+# rolling 128-step window of that trial. Unlike hcvel (which sizes max_seq_len
+# to the full trial), we deliberately train on windows: full-trial attention is
+# not worth the compute when the task -- the body -- is identifiable within a
+# fraction of one episode.
+BilevelExperiment.max_seq_len = 128
+
+# Alpha schedule crossover (k=2: explore episode 0, exploit episode 1).
+EpisodeThresholdSchedule.threshold = 1
+
+# ---- TDJepa shape ----------------------------------------------------
+# phi_dim / psi_dim match TD-JEPA Table 4's DMC proprio setting. Our walker
+# additionally varies the embodiment, so phi has strictly more to encode than
+# in the paper's fixed-body setup -- an argument for keeping 256 rather than
+# trimming toward the paper's "shallow encoder is enough" ablation.
+TDJepa.phi_dim = 256
+TDJepa.psi_dim = 50
+TDJepa.phi_encoder_hidden_dim = 256
+TDJepa.psi_encoder_hidden_dim = 256
+# hidden 1024 with two_tower=True / tower_layers=2 / trunk_layers=1 reproduces
+# the paper's "hidden layers 3" SF predictor exactly.
+TDJepa.phi_predictor_hidden_dim = 1024
+TDJepa.psi_predictor_hidden_dim = 1024
+# DMC rewards are dense and bounded in [0, 1] per control step. Keep the SF
+# reward feed at unit scale -- no 10x rebalancing like wind / coloredgrid.
+TDJepa.reward_multiplier = 1.0
+
+# BLR noise floor, retuned for the unit-scale reward feed above. The online
+# task-inference regression fits r * TDJepa.reward_multiplier ~ psi^T z, and
+# the Thompson posterior covariance scales with sigma^2. Wind / coloredgrid
+# pair the preset's sigma=10 with reward_multiplier=10, so their scaled
+# rewards sit at ~10-30; walker's sit near 1.5 even for a competent walk
+# policy. Leaving sigma at 10 would make the sampled z direction (magnitude
+# is projected away by psi_encoder.out_norm) essentially posterior noise.
+# Dropping to 1.0 restores a comparable mean-to-noise ratio without
+# rescaling the SF phi/psi prediction targets. Overrides inference/ts_sigma10
+# from the baseline preset ladder, which is applied before this overlay.
+ThompsonSampling.sigma = 1.0
+
+# Sequence-length ladder:
+#   max_seq_len (=128) == ac_seq_len (=128) >= mlp_seq_len (=32).
+# Setting ac_seq_len == max_seq_len makes TDJepa.slice_batch short-circuit to
+# the bit-exact no-slice path, so the actor / intrinsic critic see the same
+# window the dynamics learner does.
+TDJepa.ac_seq_len = 128
+TDJepa.mlp_seq_len = 32
+
+# Fourier basis for the α / β scalars entering the actor + Q_I MLPs.
+# 2*(2*9+1) = 38 dims total, matching wind / metaworld's compact encoding
+# rather than agent/tdjepa.gin's 66-D default (n_freq=16). Keeps the actor
+# input lean now that policy_ctx + ext_ctx already contribute 720 dims.
+TDJepa.fourier_n_freq = 9
+
+# NOTE: TDJepa.zero_policy_ctx is deliberately NOT bound here. It is derived
+# from --baseline in scripts/train_dmc_walker.py: True only for pure_extrinsic (where
+# severing policy_ctx / z makes the ablation a provably SF-free AMAGO agent
+# seeing only [alpha_enc, beta_enc, gated_ext]), False everywhere else. Binding
+# it in this overlay is a footgun -- metabfm_* would lose its SF branch, and the
+# alpha/off + beta/off presets, which also skip the extrinsic encoder, would be
+# left with an all-zero actor input and train silently to garbage.
+
+# Two discount horizons:
+#   * TDJepa.gamma (=0.99, from agent/tdjepa.gin) -- the extrinsic / actor /
+#     Q_I head, and the standard DMC discount.
+#   * TDJepa.sf_gamma -- the SF Bellman backup. Raised from the global 0.97 to
+#     the TD-JEPA paper's single DMC discount of 0.98. Inert under
+#     pure_extrinsic + zero_policy_ctx; live at metaBFM.
+TDJepa.sf_gamma = 0.98
+Actor.d_hidden = 400
+
+# ---- Agent tstep / policy encoder dims -------------------------------
+agent/FFTstepEncoder.n_layers = 1
+agent/FFTstepEncoder.d_hidden = 128
+agent/FFTstepEncoder.d_output = 128
+agent/FFTstepEncoder.auto_scale = True
+
+agent/PolicyTstepEncoder.d_hidden = 256
+agent/PolicyTstepEncoder.d_output = 256
+
+# Policy traj encoder: 320/5h (head_dim=64, flash-safe). Slightly below the
+# earlier 400 matched-pair; still above ColorGrid/Wind's 256. Carries
+# policy_ctx into the actor for MetaBFM; zeroed under pure_extrinsic.
+# No window_size binding: 128-token full causal attention is cheap.
+agent/TformerTrajEncoder.d_model = 320
+agent/TformerTrajEncoder.n_heads = 5
+agent/TformerTrajEncoder.n_layers = 2
+agent/TformerTrajEncoder.pos_emb = "rope"
+
+# Extrinsic reward-context encoder stays at 400: this is the branch that
+# drives behavior under pure_extrinsic (+ high-β MetaBFM), so keep the
+# SAC-like width here even after trimming policy_ctx.
+extrinsic/TformerTrajEncoder.d_model = 400
+extrinsic/TformerTrajEncoder.n_heads = 5
+extrinsic/TformerTrajEncoder.n_layers = 2
+extrinsic/TformerTrajEncoder.pos_emb = "rope"
+
+# FFTrajEncoder fallback dims (used when policy/ff.gin is the choice).
+agent/FFTrajEncoder.d_model = 320
+agent/FFTrajEncoder.n_layers = 2
+
+# ---- Dynamics shape --------------------------------------------------
+# Unused under dynamics/noop (the pure_extrinsic default), but bound here so
+# the overlay is complete for dynamics-bearing baselines (dyncs_zsrl /
+# metabfm_* pull dynamics/latent_idm, which defaults dynamics_encoder_type to
+# TformerTrajEncoder). Embodiment is a static body but must be *inferred*
+# from interaction history, so S_θ is a mid-size causal transformer (between
+# Wind's 128 and ColorGrid's 512x6) rather than an FF encoder.
+#
+# Asymmetric LCL heads: idm_dim feeds NGU ([dyn_tstep_emb, idm]) + SF;
+# dynamics_output_dim / rldp feeds SF only (intrinsic/full leaves
+# rldp_error_coeff=0), so it can be smaller.
+DynamicsEncoder.dynamics_output_dim = 8
+DynamicsEncoder.idm_dim = 12
+DynamicsLearner.idm_hidden = 256
+DynamicsLearner.ldp_g_hidden = 256
+DynamicsLearner.probe_hidden = 256
+
+# dyn_tstep_emb = 128 matches MetaWorld's NGU composite (~140-D with idm=12).
+dynamics/FFTstepEncoder.n_layers = 2
+dynamics/FFTstepEncoder.d_hidden = 256
+dynamics/FFTstepEncoder.d_output = 128
+
+# S_θ: Tformer 256x3x4, RoPE. head_dim = 256/4 = 64 (even, flash_attn-safe).
+# Full causal attention on the 128-token train window (no window_size bind).
+# pos_emb must be set here: amago defaults to "fixed", and dynamics/latent_idm
+# only flips sigma_reparam — without this override the dynamics tformer would
+# silently get sinusoidal PE.
+dynamics/TformerTrajEncoder.d_model = 256
+dynamics/TformerTrajEncoder.n_heads = 4
+dynamics/TformerTrajEncoder.n_layers = 3
+dynamics/TformerTrajEncoder.pos_emb = "rope"
+
+# ---- Intrinsic critic shape ------------------------------------------
+# The intrinsic critic reuses the actor's policy_ctx (PolicyTstepEncoder +
+# traj_encoder_pi above), so it has no encoder dims of its own to bind.
+# Under intrinsic/full (MetaWorld recipe): NGU on [dyn_tstep_emb, idm] +
+# decayed RND on observed_normalized; e3b / rldp_error off.
+
+# 2-step returns on the extrinsic RL head. intrinsic/noop leaves n_step at the
+# default 1, so this must be bound explicitly.
+IntrinsicCriticStack.n_step = 2
+
+IntrinsicCriticStack.e3b_lambda = 1.0
+# Between ColorGrid's 50k and MetaWorld's 300k; walker episodes are shorter
+# than MetaWorld's 500-step k-shot but longer/heavier than ColorGrid.
+IntrinsicCriticStack.rnd_coeff_decay_steps = 100000
+
+# Keep both reward channels at env-natural scale so the two-hot bin range below
+# maps directly to raw returns (overrides intrinsic/full.gin's default 10.0).
+IntrinsicCriticStack.reward_multiplier = 1.0
+TDJepa.extrinsic_reward_multiplier = 1.0
+
+# ---- NCriticsTwoHot bin range (intrinsic critic) ---------------------
+# Bins are raw reward units: linspace(min_return, max_return, output_bins), no
+# PopArt on this head. DMC per-control-step reward is in [0, 1] and frame_skip=2
+# sums the skip, so per-agent-step reward is in [0, 2]. The discounted extrinsic
+# Q envelope is ~2/(1-0.99)=200; RMS-normalized intrinsic bonuses land in a
+# similar O(100-200) band at beta=0. Both channels are non-negative, but
+# min_return=-100 reserves a cheap negative tail for early-training undershoot
+# and n-step transients (init_value=0 sits off the edge of support). Bin width
+# is 600/256 ≈ 2.34 raw reward units. Watch IntrinsicQ/TD Target min for
+# pegging at -100; if the intrinsic corner runs hot, lower reward_multiplier
+# rather than widening max_return.
+intrinsic/NCriticsTwoHot.min_return  = -100.0
+intrinsic/NCriticsTwoHot.max_return  = 500.0
+intrinsic/NCriticsTwoHot.output_bins = 256
+intrinsic/NCriticsTwoHot.use_symlog  = False
+intrinsic/NCriticsTwoHot.init_value  = 0.0
+intrinsic/NCriticsTwoHot.d_hidden    = 300
+intrinsic/NCriticsTwoHot.n_layers    = 2

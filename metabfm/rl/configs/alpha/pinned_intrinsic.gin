@@ -1,0 +1,29 @@
+# α axis: PINNED to 1.0 (intrinsic / extrinsic only — no SF blend).
+#
+# α ≡ 1 across training and evaluation. V_combined collapses to Q_I, so
+# the agent ignores the SF backbone for action selection entirely. The
+# intrinsic critic stack IS constructed (alpha_dist.max_value > 0) and
+# trains on whatever (1-β) · r_int + β · r_ext mix the β preset selects.
+#
+# val_alpha_schedule is also pinned at 1.0 so the val-alpha eval phase
+# (max_value > 0 gate) runs at α=1, β=0.  This is meaningful for
+# pure_extrinsic and intrinsic_meta_rl: confirms exploit-time behaviour
+# under the same α value used at training.
+#
+# Use cases:
+#   * pure_extrinsic (paired with beta/pinned_extrinsic): Q_I trained on
+#     pure r_ext → collapses to AMAGO actor-critic on extrinsic rewards.
+#   * intrinsic_meta_rl (paired with beta/varying): Q_I trained on a
+#     β-mixed reward, where β varies across training to learn a family
+#     of policies from pure curiosity to pure extrinsic.
+
+import metabfm.rl.zero_shot_rl
+
+TDJepa.alpha_dist = @alpha/ConstantAlpha()
+alpha/ConstantAlpha.value = 1.0
+
+TDJepa.n_alphas = 1
+
+TDJepa.val_alpha_schedule = @alpha_val/ConstantSchedule()
+alpha_val/ConstantSchedule.dist = @alpha_val/ConstantAlpha()
+alpha_val/ConstantAlpha.value = 1.0
